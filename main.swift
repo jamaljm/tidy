@@ -426,7 +426,7 @@ final class FirstMouseButton: NSButton {
     let bg = NSView()
     let btn = FirstMouseButton()
 
-    enum State: Equatable { case idle, checking, ok, suggest(String) }
+    enum State: Equatable { case idle, checking, ok, suggest(Fix) }
     private(set) var state: State = .idle
 
     // idle = green wand, checking = grey dots, ok = small green tick, suggest = orange wand.
@@ -438,7 +438,9 @@ final class FirstMouseButton: NSButton {
         case .idle: (symbol, color, alpha, tip) = ("wand.and.stars", Self.green, 0.6, "Fix with Tidy (tap ⌥ twice)")
         case .checking: (symbol, color, alpha, tip) = ("ellipsis", .systemGray, 0.85, "Checking…")
         case .ok: (symbol, color, alpha, tip) = ("checkmark", Self.green, 0.75, "Looks good")
-        case .suggest(let fix): (symbol, color, alpha, tip) = ("wand.and.stars", .systemOrange, 1, "Click to fix:\n\n\(fix)")
+        case .suggest(let fix):
+            let alternative = fix.alternative.map { "\n\nOr (\(fix.altLabel ?? "alternative")): \($0)" } ?? ""
+            (symbol, color, alpha, tip) = ("wand.and.stars", .systemOrange, 1, "Click to fix:\n\n\(fix.text)\(alternative)")
         }
         bg.layer?.backgroundColor = color.withAlphaComponent(alpha).cgColor
         btn.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Tidy")?
@@ -470,11 +472,15 @@ final class KeyPanel: NSPanel {
     let title = NSTextField(labelWithString: "Tidy")
     let hint = NSTextField(labelWithString: "")
     let body = NSTextField(wrappingLabelWithString: "")
+    let altCaption = NSTextField(labelWithString: "")
+    let altBody = NSTextField(wrappingLabelWithString: "")
     let spinner = NSProgressIndicator()
     let replaceBtn = NSButton(title: "Replace", target: nil, action: nil)
+    let alternativeBtn = NSButton(title: "Use alternative", target: nil, action: nil)
     let cancelBtn = NSButton(title: "Cancel", target: nil, action: nil)
     let stack = NSStackView()
-    var onDecision: ((Bool) -> Void)?
+    var onDecision: ((String?) -> Void)?
+    var result: Fix?
     var anchor: NSRect?
     static let width: CGFloat = 380
 
@@ -508,6 +514,12 @@ final class KeyPanel: NSPanel {
         body.font = .systemFont(ofSize: 14)
         body.isSelectable = true
         body.preferredMaxLayoutWidth = Popup.width - 32
+        altCaption.font = .systemFont(ofSize: 11)
+        altCaption.textColor = .secondaryLabelColor
+        altBody.font = .systemFont(ofSize: 14)
+        altBody.isSelectable = true
+        altBody.preferredMaxLayoutWidth = Popup.width - 32
+        hideAlternative()
 
         spinner.style = .spinning
         spinner.controlSize = .small
@@ -516,11 +528,14 @@ final class KeyPanel: NSPanel {
         replaceBtn.keyEquivalent = "\r"
         replaceBtn.target = self
         replaceBtn.action = #selector(accept)
+        alternativeBtn.bezelStyle = .rounded
+        alternativeBtn.target = self
+        alternativeBtn.action = #selector(acceptAlternative)
         cancelBtn.bezelStyle = .rounded
         cancelBtn.keyEquivalent = "\u{1b}"
         cancelBtn.target = self
         cancelBtn.action = #selector(cancel)
-        let buttons = NSStackView(views: [spinner, NSView(), cancelBtn, replaceBtn])
+        let buttons = NSStackView(views: [spinner, NSView(), cancelBtn, alternativeBtn, replaceBtn])
         buttons.orientation = .horizontal
 
         stack.orientation = .vertical
@@ -528,7 +543,7 @@ final class KeyPanel: NSPanel {
         stack.spacing = 10
         stack.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
         stack.translatesAutoresizingMaskIntoConstraints = false
-        for v in [header, body, buttons] { stack.addArrangedSubview(v) }
+        for v in [header, body, altCaption, altBody, buttons] { stack.addArrangedSubview(v) }
         header.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
         buttons.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -32).isActive = true
 
@@ -546,6 +561,8 @@ final class KeyPanel: NSPanel {
     func showLoading(anchor: NSRect?) {
         self.anchor = anchor
         onDecision = nil
+        result = nil
+        hideAlternative()
         body.stringValue = "Fixing…"
         body.textColor = .secondaryLabelColor
         hint.stringValue = "esc to cancel"
@@ -556,18 +573,32 @@ final class KeyPanel: NSPanel {
         present()
     }
 
-    func showResult(_ text: String, decision: @escaping (Bool) -> Void) {
-        body.stringValue = text
+    func showResult(_ fix: Fix, decision: @escaping (String?) -> Void) {
+        result = fix
+        body.stringValue = fix.text
+        hideAlternative()
+        if let alternative = fix.alternative {
+            let label = fix.altLabel ?? "alternative"
+            altCaption.stringValue = "Or, \(label):"
+            altBody.stringValue = alternative
+            alternativeBtn.title = "Use \(label)"
+            altCaption.isHidden = false
+            altBody.isHidden = false
+            alternativeBtn.isHidden = false
+        }
         body.textColor = .labelColor
         hint.stringValue = "↩ replace · esc cancel"
         spinner.stopAnimation(nil)
         spinner.isHidden = true
         replaceBtn.isHidden = false
+        cancelBtn.isHidden = false
         onDecision = decision
         present()
     }
 
     func showNote(_ text: String, autoClose: Double = 1.4) {
+        result = nil
+        hideAlternative()
         body.stringValue = text
         body.textColor = .labelColor
         hint.stringValue = ""
@@ -601,22 +632,30 @@ final class KeyPanel: NSPanel {
         if takeKeyboard { panel.makeKeyAndOrderFront(nil) } else { panel.orderFrontRegardless() }
     }
 
-    @objc func accept() { finish(true) }
-    @objc func cancel() { finish(false) }
+    private func hideAlternative() {
+        altCaption.isHidden = true
+        altBody.isHidden = true
+        alternativeBtn.isHidden = true
+    }
 
-    private func finish(_ ok: Bool) {
+    @objc func accept() { finish(result?.text) }
+    @objc func acceptAlternative() { finish(result?.alternative) }
+    @objc func cancel() { finish(nil) }
+
+    private func finish(_ text: String?) {
         let d = onDecision
         onDecision = nil
         close()
-        d?(ok)
-        if d == nil && !ok { AppDelegate.shared.cancelPending() }
+        result = nil
+        d?(text)
+        if d == nil && text == nil { AppDelegate.shared.cancelPending() }
     }
 
     func close() { panel.orderOut(nil) }
 
     // Clicking somewhere else = cancel.
     func windowDidResignKey(_ notification: Notification) {
-        if panel.isVisible { finish(false) }
+        if panel.isVisible { finish(nil) }
     }
 }
 
@@ -691,6 +730,7 @@ final class KeyPanel: NSPanel {
             gap(), label("Model", bold: true), modelPopup,
             gap(), label("How it works", bold: true), autoBox, buttonBox, previewBox,
             label("Shortcut: tap ⌥ Option twice to fix the text box you're in."),
+            label("Tap ⌥ three times to use the alternative, when available."),
             gap(), NSStackView(views: [axStatus, axButton]),
         ])
         stack.orientation = .vertical
@@ -773,10 +813,12 @@ final class KeyPanel: NSPanel {
     var autoTask: Task<Void, Never>?
     static let pause: TimeInterval = 1.0
 
-    // Double-tap Option.
+    // Double/triple-tap Option.
     var optDownAt: TimeInterval = 0
     var optAlone = false
     var lastOptTap: TimeInterval = 0
+    var pendingOptionFix: DispatchWorkItem?
+    var pendingOptionTarget: (element: AXUIElement, key: String)?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         AppDelegate.shared = self
@@ -858,9 +900,30 @@ final class KeyPanel: NSPanel {
         }
     }
 
-    // Two quick taps of Option on its own (no other key in between) = fix.
+    func optionTarget() -> (element: AXUIElement, key: String)? {
+        guard let el = AX.focused(), AX.pid(el) != getpid(), AX.isTextBox(el) else { return nil }
+        let selection = clean(AX.str(el, kAXSelectedTextAttribute) ?? "")
+        let text = selection.isEmpty ? clean(AX.str(el, kAXValueAttribute) ?? "") : selection
+        guard !text.isEmpty else { return nil }
+        return (el, WritingContext.cacheKey(text, context: AX.context(el)))
+    }
+
+    func matchesOptionTarget(_ target: (element: AXUIElement, key: String)) -> Bool {
+        guard let current = optionTarget() else { return false }
+        return CFEqual(current.element, target.element) && current.key == target.key
+    }
+
+    func cancelOptionTaps() {
+        pendingOptionFix?.cancel()
+        pendingOptionFix = nil
+        pendingOptionTarget = nil
+        lastOptTap = 0
+        optAlone = false
+    }
+
+    // Wait for a third tap only when this text already has a cached alternative.
     func handleKeys(_ e: NSEvent) {
-        if e.type == .keyDown { optAlone = false; lastOptTap = 0; return }
+        if e.type == .keyDown { cancelOptionTaps(); return }
         let isOption = e.keyCode == 58 || e.keyCode == 61
         let mods = e.modifierFlags.intersection([.command, .option, .control, .shift])
         if isOption && mods == .option {
@@ -868,16 +931,31 @@ final class KeyPanel: NSPanel {
             optAlone = true
         } else if isOption && mods.isEmpty && optAlone {
             optAlone = false
-            guard e.timestamp - optDownAt < 0.3 else { lastOptTap = 0; return }
-            if e.timestamp - lastOptTap < 0.45 {
-                lastOptTap = 0
-                trigger()
+            guard e.timestamp - optDownAt < 0.3 else { cancelOptionTaps(); return }
+            if lastOptTap > 0 && e.timestamp - lastOptTap < 0.45 {
+                if let target = pendingOptionTarget {
+                    cancelOptionTaps()
+                    if matchesOptionTarget(target) { trigger(useAlternative: true) }
+                } else if let target = optionTarget(), cache[target.key]?.alternative != nil {
+                    lastOptTap = e.timestamp
+                    pendingOptionTarget = target
+                    let work = DispatchWorkItem { [weak self] in
+                        guard let self else { return }
+                        self.cancelOptionTaps()
+                        if self.matchesOptionTarget(target) { self.trigger() }
+                    }
+                    pendingOptionFix = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: work)
+                } else {
+                    cancelOptionTaps()
+                    trigger()
+                }
             } else {
+                cancelOptionTaps()
                 lastOptTap = e.timestamp
             }
         } else {
-            optAlone = false
-            lastOptTap = 0
+            cancelOptionTaps()
         }
     }
 
@@ -930,7 +1008,7 @@ final class KeyPanel: NSPanel {
         if busy {
             state = .checking
         } else if let fix = cache[key] {
-            state = fix.text == text ? .ok : .suggest(fix.text)
+            state = fix.text == text ? .ok : .suggest(fix)
         } else if autoTask != nil && paused {
             state = .checking
         } else {
@@ -958,7 +1036,7 @@ final class KeyPanel: NSPanel {
 
     // MARK: Fixing (button click or shortcut)
 
-    func trigger() {
+    func trigger(useAlternative: Bool = false) {
         guard !busy else { return }
         guard AXIsProcessTrusted() else { settings.show(); return }
         busy = true
@@ -974,6 +1052,7 @@ final class KeyPanel: NSPanel {
             let key = WritingContext.cacheKey(input, context: target.context)
             var fixed = cache[key]
             if fixed == nil {
+                guard !useAlternative else { return }
                 if Settings.preview { popup.showLoading(anchor: target.anchor) }
                 do {
                     let f = try await Fixer.fix(target.text, context: target.context)
@@ -985,16 +1064,27 @@ final class KeyPanel: NSPanel {
                 }
             }
             guard let fixed, !Task.isCancelled else { return }
-            if fixed.text == input {
-                if Settings.preview { note("Looks good already ✓", near: target.anchor) }
-                return
+            var replacement = fixed.text
+            if useAlternative {
+                guard let alternative = fixed.alternative else { return }
+                replacement = alternative
+            } else {
+                if fixed.text == input && (fixed.alternative == nil || !Settings.preview) {
+                    if Settings.preview { note("Looks good already ✓", near: target.anchor) }
+                    return
+                }
+                if Settings.preview {
+                    popup.anchor = target.anchor
+                    let chosen: String? = await withCheckedContinuation { c in
+                        popup.showResult(fixed) { c.resume(returning: $0) }
+                    }
+                    guard let chosen, !Task.isCancelled else { await refocus(); return }
+                    replacement = chosen
+                }
             }
-            if Settings.preview {
-                let ok = await withCheckedContinuation { c in popup.showResult(fixed.text) { c.resume(returning: $0) } }
-                guard ok else { await refocus(); return }
-            }
-            await replace(target, with: fixed.text)
-            cache[WritingContext.cacheKey(fixed.text, context: target.context)] = Fix(text: fixed.text, alternative: nil, altLabel: nil)  // show ✓ without another check
+            await replace(target, with: replacement)
+            cache[WritingContext.cacheKey(clean(replacement), context: target.context)] =
+                Fix(text: replacement, alternative: nil, altLabel: nil)  // show ✓ without another check
         }
     }
 
