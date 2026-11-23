@@ -74,14 +74,30 @@ enum Fixer {
     Reply with only the cleaned-up message. No quotes, no explanation.
     """
 
-    static func wrap(_ text: String) -> String { "<message>\n\(text)\n</message>" }
+    static func xml(_ text: String) -> String {
+        text.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+    }
 
-    static func fix(_ text: String) async throws -> String {
+    static func wrap(_ text: String, context: WritingContext?) -> String {
+        """
+        <context>
+        <app>\(xml(context?.appName ?? ""))</app>
+        <window>\(xml(context?.windowTitle ?? ""))</window>
+        </context>
+        <message>
+        \(xml(text))
+        </message>
+        """
+    }
+
+    static func fix(_ text: String, context: WritingContext? = nil) async throws -> String {
         let out: String
         if let key = Settings.apiKey() {
-            out = try await viaAPI(text, key: key)
+            out = try await viaAPI(text, context: context, key: key)
         } else if let cli = claudeCLI() {
-            out = try await viaCLI(text, cli: cli)
+            out = try await viaCLI(text, context: context, cli: cli)
         } else {
             throw FixError.message("No AI access. Open Tidy and add an API key.")
         }
@@ -89,7 +105,7 @@ enum Fixer {
     }
 
     // Direct API call (fast, about 1-3s).
-    static func viaAPI(_ text: String, key: String) async throws -> String {
+    static func viaAPI(_ text: String, context: WritingContext?, key: String) async throws -> String {
         let model = Settings.model
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
         req.httpMethod = "POST"
@@ -103,7 +119,7 @@ enum Fixer {
             "max_tokens": 8000,
             "system": systemPrompt,
             "output_config": ["effort": "low"],
-            "messages": [["role": "user", "content": wrap(text)]],
+            "messages": [["role": "user", "content": wrap(text, context: context)]],
         ]
         if model == "claude-haiku-5-5" {
             // Grammar fixes don't need thinking; skipping it makes Haiku answer much faster.
@@ -139,7 +155,7 @@ enum Fixer {
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    static func viaCLI(_ text: String, cli: String) async throws -> String {
+    static func viaCLI(_ text: String, context: WritingContext?, cli: String) async throws -> String {
         try? FileManager.default.createDirectory(at: Settings.dir, withIntermediateDirectories: true)
         return try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global().async {
@@ -152,7 +168,7 @@ enum Fixer {
                 let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
                 p.standardInput = inPipe; p.standardOutput = outPipe; p.standardError = errPipe
                 do { try p.run() } catch { cont.resume(throwing: error); return }
-                inPipe.fileHandleForWriting.write(wrap(text).data(using: .utf8)!)
+                inPipe.fileHandleForWriting.write(wrap(text, context: context).data(using: .utf8)!)
                 try? inPipe.fileHandleForWriting.close()
                 let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
                 let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
@@ -166,7 +182,34 @@ enum Fixer {
 
 // MARK: - Accessibility helpers (read the focused text box in other apps)
 
+struct WritingContext {
+    let appName: String
+    let bundleID: String
+    let windowTitle: String
+
+    static func cacheKey(_ text: String, context: WritingContext?) -> String {
+        "\(context?.bundleID ?? "")|\(context?.windowTitle ?? "")|\(text)"
+    }
+}
+
 enum AX {
+    static func element(_ el: AXUIElement, _ name: String) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, name as CFString, &value) == .success,
+              let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    static func context(_ el: AXUIElement) -> WritingContext {
+        let owner = pid(el)
+        let app = NSRunningApplication(processIdentifier: owner)
+        let window = element(el, kAXWindowAttribute)
+            ?? element(AXUIElementCreateApplication(owner), kAXFocusedWindowAttribute)
+        let title = window.flatMap { str($0, kAXTitleAttribute) } ?? ""
+        return WritingContext(appName: app?.localizedName ?? "", bundleID: app?.bundleIdentifier ?? "",
+                              windowTitle: String(title.prefix(120)))
+    }
+
     static func focused() -> AXUIElement? {
         var v: CFTypeRef?
         guard AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(), kAXFocusedUIElementAttribute as CFString, &v) == .success,
@@ -302,6 +345,7 @@ struct Target {
     let text: String
     let replaceAll: Bool   // true = select all before pasting
     let anchor: NSRect?    // text box frame, Cocoa coords
+    let context: WritingContext?
 }
 
 // MARK: - Floating wand button
@@ -683,7 +727,7 @@ final class KeyPanel: NSPanel {
     var sourceApp: NSRunningApplication?
     var hotKeyRef: EventHotKeyRef?
 
-    // Auto-check: results by typed text, so clicking the button is instant.
+    // Auto-check: results by app, window and typed text, so clicking the button is instant.
     var cache: [String: String] = [:]
     var failed: String?
     var watched = ""
@@ -821,22 +865,24 @@ final class KeyPanel: NSPanel {
         let raw = AX.str(el, kAXValueAttribute) ?? ""
         let text = clean(raw)
         guard text.count >= 3 else { floatButton.hide(); return }
+        let context = AX.context(el)
+        let key = WritingContext.cacheKey(text, context: context)
 
-        if text != watched {
-            watched = text
+        if key != watched {
+            watched = key
             watchedSince = Date()
         }
         let paused = Date().timeIntervalSince(watchedSince) > Self.pause
 
         // You stopped typing: check it in the background.
-        if Settings.autoCheck, paused, autoTask == nil, !busy, cache[text] == nil, text != failed {
+        if Settings.autoCheck, paused, autoTask == nil, !busy, cache[key] == nil, key != failed {
             autoTask = Task { @MainActor in
                 do {
-                    let out = try await Fixer.fix(text)
+                    let out = try await Fixer.fix(text, context: context)
                     if cache.count > 200 { cache.removeAll() }
-                    cache[text] = out
+                    cache[key] = out
                 } catch {
-                    failed = text
+                    failed = key
                 }
                 autoTask = nil
             }
@@ -845,7 +891,7 @@ final class KeyPanel: NSPanel {
         let state: FloatButton.State
         if busy {
             state = .checking
-        } else if let fix = cache[text] {
+        } else if let fix = cache[key] {
             state = fix == text ? .ok : .suggest(fix)
         } else if autoTask != nil && paused {
             state = .checking
@@ -887,12 +933,13 @@ final class KeyPanel: NSPanel {
                 return
             }
             let input = clean(target.text)
-            var fixed = cache[input]
+            let key = WritingContext.cacheKey(input, context: target.context)
+            var fixed = cache[key]
             if fixed == nil {
                 if Settings.preview { popup.showLoading(anchor: target.anchor) }
                 do {
-                    let f = try await Fixer.fix(target.text)
-                    cache[input] = f
+                    let f = try await Fixer.fix(target.text, context: target.context)
+                    cache[key] = f
                     fixed = f
                 } catch {
                     if !Task.isCancelled { note(error.localizedDescription, near: target.anchor, seconds: 4) }
@@ -909,7 +956,7 @@ final class KeyPanel: NSPanel {
                 guard ok else { await refocus(); return }
             }
             await replace(target, with: fixed)
-            cache[fixed] = fixed  // so the new text shows ✓ without another check
+            cache[WritingContext.cacheKey(fixed, context: target.context)] = fixed  // show ✓ without another check
         }
     }
 
@@ -926,13 +973,18 @@ final class KeyPanel: NSPanel {
     // Grab the text: selection first, then the whole box, then clipboard as a last resort.
     func capture() async -> Target? {
         let el = AX.focused()
+        // Never use the clipboard fallback for a secure field.
+        if let el, [AX.str(el, kAXRoleAttribute), AX.str(el, kAXSubroleAttribute)].contains("AXSecureTextField") {
+            return nil
+        }
         let anchor = el.flatMap(AX.frame).map(AX.toCocoa)
+        let context = el.map(AX.context)
         if let el, AX.isTextBox(el) {
             if let sel = AX.str(el, kAXSelectedTextAttribute), !clean(sel).isEmpty {
-                return Target(text: sel, replaceAll: false, anchor: anchor)
+                return Target(text: sel, replaceAll: false, anchor: anchor, context: context)
             }
             if let val = AX.str(el, kAXValueAttribute), !clean(val).isEmpty {
-                return Target(text: val, replaceAll: true, anchor: anchor)
+                return Target(text: val, replaceAll: true, anchor: anchor, context: context)
             }
         }
         let pb = NSPasteboard.general
@@ -942,7 +994,7 @@ final class KeyPanel: NSPanel {
         Keys.press(kVK_ANSI_C)
         await sleepMs(180)
         if pb.changeCount != count, let s = pb.string(forType: .string), !s.isEmpty {
-            return Target(text: s, replaceAll: false, anchor: anchor)
+            return Target(text: s, replaceAll: false, anchor: anchor, context: context)
         }
         count = pb.changeCount
         Keys.press(kVK_ANSI_A)
@@ -950,7 +1002,7 @@ final class KeyPanel: NSPanel {
         Keys.press(kVK_ANSI_C)
         await sleepMs(180)
         if pb.changeCount != count, let s = pb.string(forType: .string), !s.isEmpty {
-            return Target(text: s, replaceAll: false, anchor: anchor)
+            return Target(text: s, replaceAll: false, anchor: anchor, context: context)
         }
         return nil
     }
