@@ -39,6 +39,11 @@ PLIST
 
 codesign --force --sign - -r='designated => identifier "com.jamal.tidy"' "$APP"
 
+if [[ "${NO_INSTALL:-0}" == "1" ]]; then
+  echo "$PWD/$APP"
+  exit 0
+fi
+
 mkdir -p ~/Applications
 rm -rf ~/Applications/Tidy.app
 cp -R "$APP" ~/Applications/Tidy.app
