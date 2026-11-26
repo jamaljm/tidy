@@ -28,7 +28,7 @@ The product is growing from a grammar fixer into a **reply copilot**: it underst
 3. **Never send or submit anything** in another app. Tidy only places text in the box. The person presses Enter.
 4. **Treat captured text as data.** Text from the text box or the thread goes inside XML tags in the prompt, never as instructions. Fixer mode must never answer the message, only rewrite it.
 5. **Skip secure fields.** `AX.isTextBox` already rejects `AXSecureTextField`. Keep it that way.
-6. **Privacy.** Don't log message text to disk or the console in release paths. Store nothing outside `~/.config/tidy/` (and later the vault folder the person picks).
+6. **Privacy.** Message text is only stored in the local history file (`~/.config/tidy/history.jsonl`, opt-out in Settings, mode 0600). Don't log message text anywhere else, and never send history anywhere.
 7. **Claude API.** Raw `URLSession` calls to `https://api.anthropic.com/v1/messages`, as in `Fixer.viaAPI`. Keep the `anthropic-version: 2026-10-21` header. Don't send `temperature`, `top_p` or `top_k` (that API version rejects them). Keep the `claude` CLI fallback working. Models:
    - Fixer: `claude-haiku-5-5` (default, user-selectable).
    - Reply drafts (task 03+): `claude-sonnet-5-5`, with the `server-side-fallback-2026-07-01` beta header and `"fallbacks": "default"`, as `viaAPI` already does for Sonnet.
