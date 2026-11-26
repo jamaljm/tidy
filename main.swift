@@ -40,9 +40,65 @@ enum Settings {
         set { UserDefaults.standard.set(newValue, forKey: "showButton") }
     }
 
+    static var keepHistory: Bool {
+        get { UserDefaults.standard.object(forKey: "keepHistory") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "keepHistory") }
+    }
+
     static var preview: Bool {
         get { UserDefaults.standard.object(forKey: "preview2") as? Bool ?? false }
         set { UserDefaults.standard.set(newValue, forKey: "preview2") }
+    }
+}
+
+// MARK: - History
+
+@MainActor enum History {
+    static var file: URL { Settings.dir.appendingPathComponent("history.jsonl") }
+    static var enabled: Bool { Settings.keepHistory && !CommandLine.arguments.contains("--test") }
+
+    // O_NOFOLLOW avoids following a history-file symlink. Set permissions before writing any text.
+    private static func handle() -> FileHandle? {
+        guard enabled else { return nil }
+        do { try FileManager.default.createDirectory(at: Settings.dir, withIntermediateDirectories: true) }
+        catch { return nil }
+        let fd = open(file.path, O_RDWR | O_CREAT | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { return nil }
+        guard fchmod(fd, 0o600) == 0 else { close(fd); return nil }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    }
+
+    static func trimOnLaunch() {
+        guard let handle = handle() else { return }
+        defer { try? handle.close() }
+        do {
+            let data = try handle.readToEnd() ?? Data()
+            let lines = data.split(separator: 0x0a)
+            guard lines.count > 5_000 else { return }
+            var kept = Data()
+            for line in lines.suffix(5_000) { kept.append(contentsOf: line); kept.append(0x0a) }
+            try handle.seek(toOffset: 0)
+            try handle.write(contentsOf: kept)
+            try handle.truncate(atOffset: UInt64(kept.count))
+        } catch {} // History is best-effort and must never interrupt fixing.
+    }
+
+    static func record(_ event: String, context: WritingContext?, fields: [String: Any] = [:]) {
+        guard enabled else { return }
+        var entry = fields
+        entry["event"] = event
+        entry["ts"] = ISO8601DateFormatter().string(from: Date())
+        entry["app"] = context?.appName ?? ""
+        entry["bundleID"] = context?.bundleID ?? ""
+        entry["window"] = context?.windowTitle ?? ""
+        guard var data = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]),
+              let handle = handle() else { return }
+        defer { try? handle.close() }
+        data.append(0x0a)
+        do {
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data)
+        } catch {}
     }
 }
 
@@ -54,6 +110,7 @@ enum FixError: LocalizedError {
 }
 
 struct Fix: Equatable {
+    let historyID = UUID().uuidString
     let text: String
     let alternative: String?
     let altLabel: String?
@@ -109,12 +166,12 @@ enum Fixer {
         """
     }
 
-    static func fix(_ text: String, context: WritingContext? = nil) async throws -> Fix {
+    static func fix(_ text: String, context: WritingContext? = nil, model: String = Settings.model) async throws -> Fix {
         let out: Fix
         if let key = Settings.apiKey() {
-            out = try await viaAPI(text, context: context, key: key)
+            out = try await viaAPI(text, context: context, key: key, model: model)
         } else if let cli = claudeCLI() {
-            out = try await viaCLI(text, context: context, cli: cli)
+            out = try await viaCLI(text, context: context, cli: cli, model: model)
         } else {
             throw FixError.message("No AI access. Open Tidy and add an API key.")
         }
@@ -122,8 +179,7 @@ enum Fixer {
     }
 
     // Direct API call (fast, about 1-3s).
-    static func viaAPI(_ text: String, context: WritingContext?, key: String) async throws -> Fix {
-        let model = Settings.model
+    static func viaAPI(_ text: String, context: WritingContext?, key: String, model: String) async throws -> Fix {
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
         req.httpMethod = "POST"
         req.timeoutInterval = 60
@@ -208,18 +264,18 @@ enum Fixer {
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    static func viaCLI(_ text: String, context: WritingContext?, cli: String) async throws -> Fix {
-        let output: String = try await cliOutput(text, context: context, cli: cli)
+    static func viaCLI(_ text: String, context: WritingContext?, cli: String, model: String) async throws -> Fix {
+        let output: String = try await cliOutput(text, context: context, cli: cli, model: model)
         return try parse(output, lenient: true)
     }
 
-    static func cliOutput(_ text: String, context: WritingContext?, cli: String) async throws -> String {
+    static func cliOutput(_ text: String, context: WritingContext?, cli: String, model: String) async throws -> String {
         try? FileManager.default.createDirectory(at: Settings.dir, withIntermediateDirectories: true)
         return try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global().async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: cli)
-                p.arguments = ["-p", "--model", Settings.model, "--system-prompt", systemPrompt + "\nReply with only a JSON object with keys fixed, alternative, label.",
+                p.arguments = ["-p", "--model", model, "--system-prompt", systemPrompt + "\nReply with only a JSON object with keys fixed, alternative, label.",
                                "--tools", "", "--no-session-persistence",
                                "--setting-sources", "", "--strict-mcp-config"]
                 p.currentDirectoryURL = Settings.dir
@@ -401,6 +457,7 @@ func sleepMs(_ ms: UInt64) async { try? await Task.sleep(nanoseconds: ms * 1_000
 
 struct Target {
     let text: String
+    let element: AXUIElement?
     let replaceAll: Bool   // true = select all before pasting
     let anchor: NSRect?    // text box frame, Cocoa coords
     let context: WritingContext?
@@ -681,6 +738,7 @@ final class KeyPanel: NSPanel {
     let autoBox = NSButton(checkboxWithTitle: "Auto-check when I stop typing", target: nil, action: nil)
     let buttonBox = NSButton(checkboxWithTitle: "Show the little button on text boxes", target: nil, action: nil)
     let previewBox = NSButton(checkboxWithTitle: "Show a preview popup before replacing", target: nil, action: nil)
+    let historyBox = NSButton(checkboxWithTitle: "Keep a local history of fixes (never leaves this Mac)", target: nil, action: nil)
     let axStatus = NSTextField(labelWithString: "")
     let axButton = NSButton(title: "Open Accessibility Settings", target: nil, action: nil)
 
@@ -732,7 +790,7 @@ final class KeyPanel: NSPanel {
         modelPopup.target = self
         modelPopup.action = #selector(changeModel)
 
-        for b in [autoBox, buttonBox, previewBox] { b.target = self; b.action = #selector(toggle(_:)) }
+        for b in [autoBox, buttonBox, previewBox, historyBox] { b.target = self; b.action = #selector(toggle(_:)) }
         axButton.bezelStyle = .rounded
         axButton.target = self
         axButton.action = #selector(openAX)
@@ -740,7 +798,7 @@ final class KeyPanel: NSPanel {
         let stack = NSStackView(views: [
             label("API key", bold: true), NSStackView(views: [keyField, save]), keyStatus, getKey,
             gap(), label("Model", bold: true), modelPopup,
-            gap(), label("How it works", bold: true), autoBox, buttonBox, previewBox,
+            gap(), label("How it works", bold: true), autoBox, buttonBox, previewBox, historyBox,
             label("Shortcut: tap ⌥ Option twice to fix the text box you're in."),
             label("Tap ⌥ three times to use the alternative, when available."),
             gap(), NSStackView(views: [axStatus, axButton]),
@@ -770,6 +828,7 @@ final class KeyPanel: NSPanel {
         autoBox.state = Settings.autoCheck ? .on : .off
         buttonBox.state = Settings.showButton ? .on : .off
         previewBox.state = Settings.preview ? .on : .off
+        historyBox.state = Settings.keepHistory ? .on : .off
         let trusted = AXIsProcessTrusted()
         axStatus.stringValue = trusted ? "✓ Accessibility is on" : "⚠︎ Tidy needs Accessibility permission"
         axStatus.textColor = trusted ? .systemGreen : .systemOrange
@@ -798,6 +857,7 @@ final class KeyPanel: NSPanel {
         if sender === autoBox { Settings.autoCheck = on }
         if sender === buttonBox { Settings.showButton = on }
         if sender === previewBox { Settings.preview = on }
+        if sender === historyBox { Settings.keepHistory = on }
         AppDelegate.shared.settingsChanged()
     }
 
@@ -812,6 +872,7 @@ final class KeyPanel: NSPanel {
     var floatButton: FloatButton!
     let popup = Popup()
     let settings = SettingsWindow()
+    var previewContext: WritingContext?
     var busy = false
     var job: Task<Void, Never>?
     var sourceApp: NSRunningApplication?
@@ -832,8 +893,20 @@ final class KeyPanel: NSPanel {
     var pendingOptionFix: DispatchWorkItem?
     var pendingOptionTarget: (element: AXUIElement, key: String)?
 
+    struct PendingEdit {
+        let element: AXUIElement
+        let pastedValue: String
+        let input: String
+        let context: WritingContext?
+        let suggestionID: String
+        let pasteID: String
+        let deadline: TimeInterval
+    }
+    var pendingEdits: [PendingEdit] = []
+
     func applicationDidFinishLaunching(_ n: Notification) {
         AppDelegate.shared = self
+        History.trimOnLaunch()
         floatButton = FloatButton { [weak self] in self?.trigger() }
         setupMenu()
         registerHotKey()
@@ -863,6 +936,7 @@ final class KeyPanel: NSPanel {
     }
 
     func settingsChanged() {
+        if !Settings.keepHistory { pendingEdits.removeAll() }
         cache.removeAll()
         failed = nil
         rebuildMenu()
@@ -882,6 +956,7 @@ final class KeyPanel: NSPanel {
     func rebuildMenu() {
         let m = NSMenu()
         m.addItem(item("Settings…", #selector(openSettings)))
+        m.addItem(item("Open history folder", #selector(openHistory)))
         m.addItem(item("Fix text now   (tap ⌥ twice)", #selector(menuFix)))
         m.addItem(.separator())
         let a = item("Auto-check when I stop typing", #selector(toggleAuto))
@@ -897,6 +972,13 @@ final class KeyPanel: NSPanel {
     }
 
     @objc func openSettings() { settings.show() }
+    @objc func openHistory() {
+        if FileManager.default.fileExists(atPath: History.file.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([History.file])
+        } else {
+            NSWorkspace.shared.open(Settings.dir)
+        }
+    }
     @objc func menuFix() { DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.trigger() } }
     @objc func toggleAuto() { Settings.autoCheck.toggle(); settingsChanged() }
     @objc func quit() { NSApp.terminate(nil) }
@@ -984,6 +1066,7 @@ final class KeyPanel: NSPanel {
     // MARK: Watching the text box (runs every 0.3s)
 
     func tick() {
+        checkPendingEdits()
         guard AXIsProcessTrusted(), !popup.isVisible,
               let el = AX.focused(), AX.pid(el) != getpid(), AX.isTextBox(el),
               let fr = AX.frame(el), fr.width > 60, fr.height > 12 else {
@@ -1006,7 +1089,7 @@ final class KeyPanel: NSPanel {
         if Settings.autoCheck, paused, autoTask == nil, !busy, cache[key] == nil, key != failed {
             autoTask = Task { @MainActor in
                 do {
-                    let out = try await Fixer.fix(text, context: context)
+                    let out = try await checkedFix(text, context: context)
                     if cache.count > 200 { cache.removeAll() }
                     cache[key] = out
                 } catch {
@@ -1055,11 +1138,12 @@ final class KeyPanel: NSPanel {
         sourceApp = NSWorkspace.shared.frontmostApplication
 
         job = Task { @MainActor in
-            defer { busy = false }
+            defer { busy = false; previewContext = nil }
             guard let target = await capture() else {
                 note("No text found. Click into a text box first.", near: nil)
                 return
             }
+            previewContext = target.context
             let input = target.text
             let key = WritingContext.cacheKey(input, context: target.context)
             var fixed = cache[key]
@@ -1067,7 +1151,7 @@ final class KeyPanel: NSPanel {
                 guard !useAlternative else { return }
                 if Settings.preview { popup.showLoading(anchor: target.anchor) }
                 do {
-                    let f = try await Fixer.fix(target.text, context: target.context)
+                    let f = try await checkedFix(target.text, context: target.context)
                     cache[key] = f
                     fixed = f
                 } catch {
@@ -1090,13 +1174,59 @@ final class KeyPanel: NSPanel {
                     let chosen: String? = await withCheckedContinuation { c in
                         popup.showResult(fixed) { c.resume(returning: $0) }
                     }
-                    guard let chosen, !Task.isCancelled else { await refocus(); return }
+                    guard let chosen, !Task.isCancelled else {
+                        History.record("cancelled", context: target.context,
+                                       fields: ["suggestionID": fixed.historyID])
+                        await refocus()
+                        return
+                    }
                     replacement = chosen
                 }
             }
-            await replace(target, with: replacement)
+            let pasteID = UUID().uuidString
+            guard let pasted = await replace(target, with: replacement) else { return }
+            History.record(useAlternative ? "pasted_alt" : "pasted_fix", context: target.context,
+                           fields: ["input": input, "output": replacement,
+                                    "suggestionID": fixed.historyID, "pasteID": pasteID])
+            if History.enabled, let element = target.element, let value = pasted.value {
+                pendingEdits.append(PendingEdit(element: element, pastedValue: value, input: input,
+                    context: target.context, suggestionID: fixed.historyID,
+                    pasteID: pasteID, deadline: pasted.time + 20))
+                checkPendingEdits()
+            }
             cache[WritingContext.cacheKey(replacement, context: target.context)] =
                 Fix(text: replacement, alternative: nil, altLabel: nil)  // show ✓ without another check
+        }
+    }
+
+    func checkedFix(_ input: String, context: WritingContext?) async throws -> Fix {
+        let model = Settings.model
+        let start = ProcessInfo.processInfo.systemUptime
+        let fix = try await Fixer.fix(input, context: context, model: model)
+        History.record("suggested", context: context, fields: [
+            "input": input, "fixed": fix.text, "alternative": fix.alternative ?? "",
+            "label": fix.altLabel ?? "", "model": model,
+            "ms": Int((ProcessInfo.processInfo.systemUptime - start) * 1_000),
+            "suggestionID": fix.historyID,
+        ])
+        return fix
+    }
+
+    func checkPendingEdits() {
+        guard History.enabled else { pendingEdits.removeAll(); return }
+        let focused = AX.focused()
+        let now = ProcessInfo.processInfo.systemUptime
+        pendingEdits.removeAll { pending in
+            let leftBox = focused.map { !CFEqual($0, pending.element) } ?? true
+            guard leftBox || now >= pending.deadline else { return false }
+            if AX.isTextBox(pending.element), let value = AX.str(pending.element, kAXValueAttribute),
+               value != pending.pastedValue {
+                History.record("sent_text", context: pending.context, fields: [
+                    "input": pending.input, "output": value, "pasted": pending.pastedValue,
+                    "suggestionID": pending.suggestionID, "pasteID": pending.pasteID,
+                ])
+            }
+            return true
         }
     }
 
@@ -1106,6 +1236,7 @@ final class KeyPanel: NSPanel {
     }
 
     func cancelPending() {
+        if busy { History.record("cancelled", context: previewContext) }
         job?.cancel()
         Task { await refocus() }
     }
@@ -1121,10 +1252,10 @@ final class KeyPanel: NSPanel {
         let context = el.map(AX.context)
         if let el, AX.isTextBox(el) {
             if let sel = AX.str(el, kAXSelectedTextAttribute), !clean(sel).isEmpty {
-                return Target(text: sel, replaceAll: false, anchor: anchor, context: context)
+                return Target(text: sel, element: el, replaceAll: false, anchor: anchor, context: context)
             }
             if let val = AX.str(el, kAXValueAttribute), !clean(val).isEmpty {
-                return Target(text: val, replaceAll: true, anchor: anchor, context: context)
+                return Target(text: val, element: el, replaceAll: true, anchor: anchor, context: context)
             }
         }
         let pb = NSPasteboard.general
@@ -1134,7 +1265,7 @@ final class KeyPanel: NSPanel {
         Keys.press(kVK_ANSI_C)
         await sleepMs(180)
         if pb.changeCount != count, let s = pb.string(forType: .string), !s.isEmpty {
-            return Target(text: s, replaceAll: false, anchor: anchor, context: context)
+            return Target(text: s, element: el, replaceAll: false, anchor: anchor, context: context)
         }
         count = pb.changeCount
         Keys.press(kVK_ANSI_A)
@@ -1142,7 +1273,7 @@ final class KeyPanel: NSPanel {
         Keys.press(kVK_ANSI_C)
         await sleepMs(180)
         if pb.changeCount != count, let s = pb.string(forType: .string), !s.isEmpty {
-            return Target(text: s, replaceAll: false, anchor: anchor, context: context)
+            return Target(text: s, element: el, replaceAll: false, anchor: anchor, context: context)
         }
         return nil
     }
@@ -1153,9 +1284,30 @@ final class KeyPanel: NSPanel {
         await sleepMs(120)
     }
 
-    func replace(_ target: Target, with text: String) async {
+    func replace(_ target: Target, with text: String) async -> (value: String?, time: TimeInterval)? {
         await refocus()
+        guard let focused = AX.focused(), AX.isTextBox(focused),
+              let element = target.element, CFEqual(focused, element) else { return nil }
+        // A second paste ends observation of the previous paste in this box.
+        checkPendingEdits()
+        pendingEdits.removeAll { CFEqual($0.element, element) }
+        var expectedValue: String?
+        if target.replaceAll {
+            expectedValue = text
+        } else if let value = AX.str(element, kAXValueAttribute) {
+            var ref: CFTypeRef?
+            var range = CFRange()
+            if AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &ref) == .success,
+               let ref, CFGetTypeID(ref) == AXValueGetTypeID(),
+               AXValueGetValue(ref as! AXValue, .cfRange, &range), range.location >= 0, range.length >= 0,
+               range.location <= (value as NSString).length,
+               range.length <= (value as NSString).length - range.location {
+                expectedValue = (value as NSString).replacingCharacters(
+                    in: NSRange(location: range.location, length: range.length), with: text)
+            }
+        }
         let saved = Keys.savePasteboard()
+        defer { Keys.restorePasteboard(saved) }
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(text, forType: .string)
@@ -1163,9 +1315,11 @@ final class KeyPanel: NSPanel {
             Keys.press(kVK_ANSI_A)
             await sleepMs(60)
         }
+        guard let current = AX.focused(), CFEqual(current, element), AX.isTextBox(current) else { return nil }
+        let pastedAt = ProcessInfo.processInfo.systemUptime
         Keys.press(kVK_ANSI_V)
         await sleepMs(500)
-        Keys.restorePasteboard(saved)
+        return (expectedValue, pastedAt)
     }
 }
 
